@@ -1,0 +1,1045 @@
+// Comic Clock Ver.4.9
+#include <M5EPD.h>
+#include <SD.h>
+#include <WiFi.h>
+#include <time.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <esp_sleep.h>
+#include <Preferences.h>
+#include "SPIFFS.h"
+
+M5EPD_Canvas canvas(&M5.EPD);
+Preferences preferences;
+
+// 設定変数
+struct Config {
+    String ssid[3];
+    String password[3];
+    String city;
+    String apiKey;
+    int imageInterval;
+    int sensorInterval;
+    int rebootInterval;
+    bool errorLogging;
+    bool batteryLogging;
+    int batteryLogInterval;
+    String startupMessage;
+} config;
+
+// 天気情報
+String todayWeather, tomorrowWeather;
+int todayTempMax, todayTempMin, tomorrowTempMax, tomorrowTempMin;
+int todayPop, tomorrowPop;
+String weeklyWeather[7];
+
+// 状態変数
+unsigned long lastRebootTime = 0;
+unsigned long lastImageChangeTime = 0;
+unsigned long lastSensorReadTime = 0;
+volatile bool showStatusInfo = false;
+volatile bool showWeeklyForecast = false;
+
+int TOTAL_IMAGES = 0;
+
+float temperature = 0.0;
+float humidity = 0.0;
+
+// バージョン情報
+const char* version = "4.9";
+
+// ウェイクアップ理由を保存する変数
+esp_sleep_wakeup_cause_t wakeup_reason;
+
+// RTCアラーム割り込みのためのGPIO
+#define RTC_INT_PIN GPIO_NUM_36
+
+// ログファイルのパス
+String errorLogFilePath = "/error_log.txt";
+String batteryLogFilePath = "/battery_log.csv";
+
+// ボタン割り込み用変数
+volatile bool g37Pressed = false;
+volatile bool g38Pressed = false;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// 割り込みハンドラ
+void IRAM_ATTR handleG37Interrupt() {
+  portENTER_CRITICAL_ISR(&mux);
+  g37Pressed = true;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+void IRAM_ATTR handleG38Interrupt() {
+  portENTER_CRITICAL_ISR(&mux);
+  g38Pressed = true;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+void setup() {
+  M5.begin();
+  M5.EPD.SetRotation(0);
+  M5.EPD.Clear(true);
+  
+  canvas.createCanvas(960, 540);
+  canvas.setTextSize(2);
+
+  // SPIFFSの初期化
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFSのマウントに失敗しました");
+  }
+
+  // ウェイクアップ理由を取得
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  // ボタン割り込みの設定
+  pinMode(37, INPUT_PULLUP);
+  pinMode(38, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(37), handleG37Interrupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(38), handleG38Interrupt, FALLING);
+
+  // RTCアラーム割り込みの設定
+  esp_sleep_enable_ext0_wakeup(RTC_INT_PIN, 0);
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    // 初回起動時の処理
+    initialSetup();
+  } else {
+    // 通常の起動処理
+    normalSetup();
+  }
+
+  // メイン処理
+  mainProcess();
+
+  // 次のアラームをセット
+  setNextAlarm();
+
+  // ディープスリープモードに入る
+  esp_deep_sleep_start();
+}
+
+void loop() {
+  // ディープスリープを使用するため、このループは実行されません
+}
+void initialSetup() {
+  displayStartupProgress(0, "Initializing...");
+
+  // bootlogo.pngを表示
+  displayBootLogo();
+
+  if(!initSD()) {
+    displayStartupProgress(20, "SD Card initialization failed");
+    delay(2000);
+  } else {
+    displayStartupProgress(20, "SD Card initialized");
+    updateFilesFromSD();  // SDカードからファイルを更新
+    checkAndCreateDirectories(); // 必要なディレクトリを作成
+    checkAndCreateImages(); // 必要な画像ファイルを作成
+    loadAndUpdateConfig(); // 設定ファイルの読み込みと更新
+  }
+
+  displayStartupProgress(30, "Loading config...");
+  if (!loadConfig()) {
+    displayStartupProgress(30, "Config load failed");
+    delay(2000);
+  }
+
+  displayStartupProgress(40, "Connecting to WiFi...");
+  if (!connectWiFi()) {
+    displayStartupProgress(40, "WiFi connection failed");
+  } else {
+    displayStartupProgress(60, "WiFi connected");
+  }
+
+  displayStartupProgress(80, "Setting up time...");
+  if (!setupTime()) {
+    displayStartupProgress(80, "Time setup failed");
+  }
+  
+  displayStartupProgress(90, "Getting weather forecast...");
+  if (!getWeeklyForecast()) {
+    displayStartupProgress(90, "Weather forecast failed");
+  }
+
+  displayStartupProgress(95, "Counting images...");
+  countImages();
+
+  displayStartupProgress(95, "Initializing SHT30 sensor...");
+  initSHT30();
+  updateTemperatureAndHumidity();
+
+  displayStartupProgress(97, "Saving config to preferences...");
+  saveConfigToPreferences();
+
+  displayStartupProgress(98, "Saving weather icons to SPIFFS...");
+  saveWeatherIconsToSPIFFS();
+
+  displayStartupProgress(100, "Startup complete!");
+  
+  delay(2000);
+
+  // Wi-Fi切断
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+
+void normalSetup() {
+  if (!loadConfig()) {
+    logError("設定の読み込みに失敗しました");
+    return;
+  }
+
+  setupTime();
+  initSHT30();
+  countImages();
+}
+
+void mainProcess() {
+  unsigned long currentTime = millis();
+
+  // ボタン押下の処理
+  if (g37Pressed) {
+    portENTER_CRITICAL(&mux);
+    g37Pressed = false;
+    portEXIT_CRITICAL(&mux);
+    showWeeklyForecast = !showWeeklyForecast;
+    displayRandomImageWithDateTime(false);  // 部分更新
+  }
+
+  if (g38Pressed) {
+    portENTER_CRITICAL(&mux);
+    g38Pressed = false;
+    portEXIT_CRITICAL(&mux);
+    showStatusInfo = !showStatusInfo;
+    displayRandomImageWithDateTime(false);  // 部分更新
+  }
+
+  // センサー読み取り
+  if (currentTime - lastSensorReadTime >= config.sensorInterval * 60000 || lastSensorReadTime == 0) {
+    updateTemperatureAndHumidity();
+    lastSensorReadTime = currentTime;
+  }
+
+  // 画像更新
+  if (currentTime - lastImageChangeTime >= config.imageInterval * 60000 || lastImageChangeTime == 0) {
+    // Wi-Fi接続
+    if (connectWiFi()) {
+      getWeeklyForecast();
+      // Wi-Fi切断
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+    }
+    displayRandomImageWithDateTime(true);  // 全画面更新
+    lastImageChangeTime = currentTime;
+  } else {
+    displayRandomImageWithDateTime(false);  // 部分更新
+  }
+
+  logBatteryStatus();
+}
+void setNextAlarm() {
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+
+  int nextWakeupMinutes = min(min(config.imageInterval, config.sensorInterval), config.batteryLogInterval);
+  timeinfo.tm_min += nextWakeupMinutes;
+  mktime(&timeinfo);
+
+  rtc_time_t alarm_time;
+  alarm_time.hour = timeinfo.tm_hour;
+  alarm_time.min = timeinfo.tm_min;
+  alarm_time.sec = timeinfo.tm_sec;
+
+  rtc_date_t alarm_date;
+  alarm_date.year = timeinfo.tm_year + 1900;
+  alarm_date.mon = timeinfo.tm_mon + 1;
+  alarm_date.day = timeinfo.tm_mday;
+
+  M5.RTC.setAlarmIRQ(alarm_date, alarm_time);
+
+  // ボタン割り込みの有効化
+  esp_sleep_enable_ext1_wakeup(((uint64_t)(1) << 37) | ((uint64_t)(1) << 38), ESP_EXT1_WAKEUP_ANY_HIGH);
+}
+
+bool initSD() {
+  if (!SD.begin()) {
+    Serial.println("SDカードの初期化に失敗しました");
+    return false;
+  }
+  
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  uint64_t usedSpace = SD.usedBytes() / (1024 * 1024);
+  uint64_t freeSpace = cardSize - usedSpace;
+
+  if (freeSpace < 10) {
+    Serial.println("警告: SDカードの空き容量が少なくなっています");
+    logError("SDカードの空き容量が10MB未満です");
+  }
+
+  return true;
+}
+
+bool loadConfig() {
+  preferences.begin("comicClock", true);
+  config.ssid[0] = preferences.getString("ssid1", "");
+  config.password[0] = preferences.getString("password1", "");
+  config.ssid[1] = preferences.getString("ssid2", "");
+  config.password[1] = preferences.getString("password2", "");
+  config.ssid[2] = preferences.getString("ssid3", "");
+  config.password[2] = preferences.getString("password3", "");
+  config.city = preferences.getString("city", "Tokyo");
+  config.apiKey = preferences.getString("apiKey", "");
+  config.imageInterval = preferences.getInt("imageInterval", 60);
+  config.sensorInterval = preferences.getInt("sensorInterval", 10);
+  config.rebootInterval = preferences.getInt("rebootInterval", 7);
+  config.errorLogging = preferences.getBool("errorLogging", true);
+  config.batteryLogging = preferences.getBool("batteryLogging", false);
+  config.batteryLogInterval = preferences.getInt("batteryLogInterval", 60);
+  config.startupMessage = preferences.getString("startupMessage", "COMIC CLOCK Loading ...");
+  preferences.end();
+  return (config.ssid[0] != "" && config.password[0] != "" && config.city != "" && config.apiKey != "");
+}
+
+void saveConfigToPreferences() {
+  preferences.begin("comicClock", false);
+  preferences.putString("ssid1", config.ssid[0]);
+  preferences.putString("password1", config.password[0]);
+  preferences.putString("ssid2", config.ssid[1]);
+  preferences.putString("password2", config.password[1]);
+  preferences.putString("ssid3", config.ssid[2]);
+  preferences.putString("password3", config.password[2]);
+  preferences.putString("city", config.city);
+  preferences.putString("apiKey", config.apiKey);
+  preferences.putInt("imageInterval", config.imageInterval);
+  preferences.putInt("sensorInterval", config.sensorInterval);
+  preferences.putInt("rebootInterval", config.rebootInterval);
+  preferences.putBool("errorLogging", config.errorLogging);
+  preferences.putBool("batteryLogging", config.batteryLogging);
+  preferences.putInt("batteryLogInterval", config.batteryLogInterval);
+  preferences.putString("startupMessage", config.startupMessage);
+  preferences.end();
+}
+
+void checkAndCreateDirectories() {
+  if (!SD.exists("/images")) {
+    SD.mkdir("/images");
+  }
+  if (!SD.exists("/icons")) {
+    SD.mkdir("/icons");
+  }
+}
+
+void loadAndUpdateConfig() {
+  File configFile = SD.open("/config.txt", FILE_READ);
+  if (configFile) {
+    while (configFile.available()) {
+      String line = configFile.readStringUntil('\n');
+      line.trim();
+      int separatorIndex = line.indexOf('=');
+      if (separatorIndex != -1) {
+        String key = line.substring(0, separatorIndex);
+        String value = line.substring(separatorIndex + 1);
+        updateConfigValue(key, value);
+      }
+    }
+    configFile.close();
+  }
+
+  // 設定ファイルの更新が必要な場合
+  configFile = SD.open("/config.txt", FILE_WRITE);
+  if (configFile) {
+    writeConfigToFile(configFile);
+    configFile.close();
+  }
+}
+
+void updateConfigValue(const String &key, const String &value) {
+  if (key == "SSID1") config.ssid[0] = value;
+  else if (key == "PASSWORD1") config.password[0] = value;
+  else if (key == "SSID2") config.ssid[1] = value;
+  else if (key == "PASSWORD2") config.password[1] = value;
+  else if (key == "SSID3") config.ssid[2] = value;
+  else if (key == "PASSWORD3") config.password[2] = value;
+  else if (key == "CITY") config.city = value;
+  else if (key == "API_KEY") config.apiKey = value;
+  else if (key == "IMAGE_INTERVAL") config.imageInterval = value.toInt();
+  else if (key == "SENSOR_INTERVAL") config.sensorInterval = value.toInt();
+  else if (key == "REBOOT_INTERVAL") config.rebootInterval = value.toInt();
+  else if (key == "ERROR_LOGGING") config.errorLogging = (value == "ON");
+  else if (key == "BATTERY_LOGGING") config.batteryLogging = (value == "ON");
+  else if (key == "BATTERY_LOG_INTERVAL") config.batteryLogInterval = value.toInt();
+  else if (key == "STARTUP_MESSAGE") config.startupMessage = value;
+}
+
+void writeConfigToFile(File &file) {
+  file.println("SSID1=" + config.ssid[0]);
+  file.println("PASSWORD1=" + config.password[0]);
+  file.println("SSID2=" + config.ssid[1]);
+  file.println("PASSWORD2=" + config.password[1]);
+  file.println("SSID3=" + config.ssid[2]);
+  file.println("PASSWORD3=" + config.password[2]);
+  file.println("CITY=" + config.city);
+  file.println("API_KEY=" + config.apiKey);
+  file.println("IMAGE_INTERVAL=" + String(config.imageInterval));
+  file.println("SENSOR_INTERVAL=" + String(config.sensorInterval));
+  file.println("REBOOT_INTERVAL=" + String(config.rebootInterval));
+  file.println("ERROR_LOGGING=" + String(config.errorLogging ? "ON" : "OFF"));
+  file.println("BATTERY_LOGGING=" + String(config.batteryLogging ? "ON" : "OFF"));
+  file.println("BATTERY_LOG_INTERVAL=" + String(config.batteryLogInterval));
+  file.println("STARTUP_MESSAGE=" + config.startupMessage);
+}
+bool connectWiFi() {
+  for (int i = 0; i < 3; i++) {
+    if (config.ssid[i].length() > 0) {
+      WiFi.begin(config.ssid[i].c_str(), config.password[i].c_str());
+      int attempts = 0;
+      while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+      }
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("Wi-Fiに接続しました: " + config.ssid[i]);
+        return true;
+      }
+    }
+  }
+  logError("Wi-Fi接続に失敗しました");
+  return false;
+}
+
+bool setupTime() {
+  configTime(9 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    time_t now;
+    time(&now);
+    lastRebootTime = now;
+    return true;
+  }
+  logError("時刻の設定に失敗しました");
+  return false;
+}
+
+bool getWeeklyForecast() {
+  if (WiFi.status() != WL_CONNECTED) {
+    logError("WiFiに接続されていないため、天気予報を取得できません");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = "http://api.openweathermap.org/data/2.5/forecast?q=" + config.city + "&appid=" + config.apiKey + "&units=metric&cnt=40";
+  
+  http.begin(url);
+  int httpResponseCode = http.GET();
+  
+  if (httpResponseCode > 0) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(32768);
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (error) {
+      logError("JSON解析に失敗しました");
+      http.end();
+      return false;
+    }
+    
+    todayWeather = interpretWeather(doc["list"][0]["weather"][0]["main"].as<String>(), doc["list"][0]["weather"][0]["description"].as<String>());
+    todayTempMax = doc["list"][0]["main"]["temp_max"].as<int>();
+    todayTempMin = doc["list"][0]["main"]["temp_min"].as<int>();
+    todayPop = doc["list"][0]["pop"].as<float>() * 100;
+    
+    tomorrowWeather = interpretWeather(doc["list"][8]["weather"][0]["main"].as<String>(), doc["list"][8]["weather"][0]["description"].as<String>());
+    tomorrowTempMax = doc["list"][8]["main"]["temp_max"].as<int>();
+    tomorrowTempMin = doc["list"][8]["main"]["temp_min"].as<int>();
+    tomorrowPop = doc["list"][8]["pop"].as<float>() * 100;
+    
+    for (int i = 0; i < 7; i++) {
+      weeklyWeather[i] = interpretWeather(doc["list"][i * 8]["weather"][0]["main"].as<String>(), doc["list"][i * 8]["weather"][0]["description"].as<String>());
+    }
+    
+    http.end();
+    return true;
+  }
+  
+  logError("天気予報の取得に失敗しました");
+  http.end();
+  return false;
+}
+
+String interpretWeather(String main, String description) {
+  if (main == "Clear") return "Clear";
+  if (main == "Clouds") {
+    if (description.indexOf("few") != -1 || description.indexOf("scattered") != -1) {
+      return "Partly Cloudy";
+    }
+    return "Cloudy";
+  }
+  if (main == "Rain") {
+    if (description.indexOf("light") != -1) {
+      return "Light Rain";
+    }
+    if (description.indexOf("heavy") != -1) {
+      return "Heavy Rain";
+    }
+    return "Rain";
+  }
+  if (main == "Snow") return "Snow";
+  if (main == "Thunderstorm") return "Thunderstorm";
+  if (main == "Drizzle") return "Light Rain";
+  if (main == "Mist" || main == "Fog") return "Fog";
+  return "Unknown";
+}
+
+void countImages() {
+  File root = SD.open("/images");
+  if (!root) {
+    logError("imagesフォルダを開けませんでした");
+    return;
+  }
+
+  TOTAL_IMAGES = 0;
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) break;
+    if (!entry.isDirectory()) {
+      String filename = String(entry.name());
+      if (filename.startsWith("img") && filename.endsWith(".jpg")) {
+        int imageNumber = filename.substring(3, 7).toInt();
+        if (imageNumber > TOTAL_IMAGES) {
+          TOTAL_IMAGES = imageNumber;
+        }
+      }
+    }
+    entry.close();
+  }
+  root.close();
+  Serial.println("最大画像番号: " + String(TOTAL_IMAGES));
+}
+
+void initSHT30() {
+  M5.SHT30.Begin();
+}
+
+bool updateTemperatureAndHumidity() {
+  M5.SHT30.UpdateData();
+  temperature = M5.SHT30.GetTemperature();
+  humidity = M5.SHT30.GetRelHumidity();
+  return (temperature != 0 && humidity != 0);
+}
+
+void displayBootLogo() {
+  if (SPIFFS.exists("/bootlogo.png")) {
+    canvas.drawPngFile(SPIFFS, "/bootlogo.png", 0, 0);
+  } else {
+    canvas.fillCanvas(0);
+    canvas.setTextColor(WHITE);
+    canvas.setTextSize(3);
+    canvas.setTextDatum(MC_DATUM);
+    canvas.drawString("Comic Clock", 480, 270);
+  }
+  canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+}
+
+void updateFilesFromSD() {
+  // bootlogo.pngの更新
+  if (SD.exists("/bootlogo.png")) {
+    copyFile(SD, "/bootlogo.png", SPIFFS, "/bootlogo.png");
+  }
+
+  // 天気アイコンの更新
+  updateWeatherIcons();
+
+  // dummy.jpgの更新
+  if (SD.exists("/dummy.jpg")) {
+    copyFile(SD, "/dummy.jpg", SPIFFS, "/dummy.jpg");
+  }
+}
+
+void updateWeatherIcons() {
+  String iconNames[] = {"clear.png", "cloudy.png", "rain.png", "snow.png", "thunderstorm.png", "partly_cloudy.png", "light_rain.png", "heavy_rain.png", "fog.png", "unknown.png"};
+  for (String iconName : iconNames) {
+    String sdPath = "/icons/" + iconName;
+    String spiffsPath = "/icons/" + iconName;
+    if (SD.exists(sdPath)) {
+      copyFile(SD, sdPath.c_str(), SPIFFS, spiffsPath.c_str());
+    }
+  }
+}
+
+void copyFile(fs::FS &srcFs, const char* srcPath, fs::FS &destFs, const char* destPath) {
+  File srcFile = srcFs.open(srcPath, FILE_READ);
+  File destFile = destFs.open(destPath, FILE_WRITE);
+  if (srcFile && destFile) {
+    while (srcFile.available()) {
+      destFile.write(srcFile.read());
+    }
+    srcFile.close();
+    destFile.close();
+  }
+}
+void checkAndCreateImages() {
+  // dummy.jpgの確認と生成
+  if (!SD.exists("/dummy.jpg")) {
+    if (SPIFFS.exists("/dummy.jpg")) {
+      copyFile(SPIFFS, "/dummy.jpg", SD, "/dummy.jpg");
+    } else {
+      createBlankJpeg(SD, "/dummy.jpg", 960, 540);
+    }
+  }
+
+  // bootlogo.pngの確認と生成
+  if (!SD.exists("/bootlogo.png")) {
+    if (SPIFFS.exists("/bootlogo.png")) {
+      copyFile(SPIFFS, "/bootlogo.png", SD, "/bootlogo.png");
+    } else {
+      createBlackPng(SD, "/bootlogo.png", 960, 540);
+    }
+  }
+
+  // 天気アイコンの確認と生成
+  String iconNames[] = {"clear.png", "cloudy.png", "rain.png", "snow.png", "thunderstorm.png", "partly_cloudy.png", "light_rain.png", "heavy_rain.png", "fog.png", "unknown.png"};
+  for (String iconName : iconNames) {
+    String iconPath = "/icons/" + iconName;
+    if (!SD.exists(iconPath)) {
+      if (SPIFFS.exists(iconPath)) {
+        copyFile(SPIFFS, iconPath.c_str(), SD, iconPath.c_str());
+      } else {
+        createBlackPng(SD, iconPath.c_str(), 20, 20);
+      }
+    }
+  }
+}
+
+void createBlankJpeg(fs::FS &fs, const char* path, int width, int height) {
+  File file = fs.open(path, FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to create file");
+    return;
+  }
+
+  // JPEGヘッダーを書き込む（簡略化された例）
+  uint8_t jpegHeader[] = {
+    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+    0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
+    0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09,
+    0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
+    0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
+    0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29,
+    0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
+    0x3C, 0x2E, 0x33, 0x34, 0x32
+  };
+  file.write(jpegHeader, sizeof(jpegHeader));
+
+  // ここで実際のピクセルデータを書き込む必要があります
+  // この例では、単純な白い画像を作成します
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      file.write((uint8_t)255);  // 白色（R=255, G=255, B=255）
+      file.write((uint8_t)255);
+      file.write((uint8_t)255);
+    }
+  }
+
+  // JPEGフッターを書き込む
+  uint8_t jpegFooter[] = {0xFF, 0xD9};
+  file.write(jpegFooter, sizeof(jpegFooter));
+
+  file.close();
+}
+
+void createBlackPng(fs::FS &fs, const char* path, int width, int height) {
+  File file = fs.open(path, FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to create file");
+    return;
+  }
+
+  // PNGヘッダー
+  uint8_t pngHeader[] = {
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52
+  };
+  file.write(pngHeader, sizeof(pngHeader));
+
+  // 幅と高さ（ビッグエンディアン）
+  file.write((width >> 24) & 0xFF);
+  file.write((width >> 16) & 0xFF);
+  file.write((width >> 8) & 0xFF);
+  file.write(width & 0xFF);
+  file.write((height >> 24) & 0xFF);
+  file.write((height >> 16) & 0xFF);
+  file.write((height >> 8) & 0xFF);
+  file.write(height & 0xFF);
+
+  // その他のヘッダー情報（8ビット、カラータイプ0（グレースケール））
+  uint8_t pngInfo[] = {0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  file.write(pngInfo, sizeof(pngInfo));
+
+  // IDAT チャンク
+  uint32_t dataSize = height * (width + 1);  // +1 for filter byte
+  file.write('I');
+  file.write('D');
+  file.write('A');
+  file.write('T');
+  file.write((dataSize >> 24) & 0xFF);
+  file.write((dataSize >> 16) & 0xFF);
+  file.write((dataSize >> 8) & 0xFF);
+  file.write(dataSize & 0xFF);
+
+  // 圧縮データ（単純な非圧縮データ）
+  for (int y = 0; y < height; y++) {
+    file.write(0);  // フィルタタイプ 0
+    for (int x = 0; x < width; x++) {
+      file.write(0);  // 黒色（0）
+    }
+  }
+
+  // CRC（ここでは簡略化のため0で埋めています）
+  file.write(0);
+  file.write(0);
+  file.write(0);
+  file.write(0);
+
+  // IEND チャンク
+  uint8_t pngEnd[] = {0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82};
+  file.write(pngEnd, sizeof(pngEnd));
+
+  file.close();
+}
+
+void displayRandomImageWithDateTime(bool fullUpdate) {
+  int randomIndex = random(1, TOTAL_IMAGES + 1);
+  char filename[21];
+  sprintf(filename, "/images/img%04d.jpg", randomIndex);
+  
+  if (fullUpdate) {
+    canvas.fillCanvas(0);
+    if (SD.exists(filename)) {
+      if (canvas.drawJpgFile(SD, filename)) {
+        Serial.println("画像を読み込みました: " + String(filename));
+      } else {
+        logError("画像の読み込みに失敗しました: " + String(filename));
+        if (SPIFFS.exists("/dummy.jpg")) {
+          canvas.drawJpgFile(SPIFFS, "/dummy.jpg");
+        }
+      }
+    } else {
+      logError("画像ファイルが見つかりません: " + String(filename));
+      if (SPIFFS.exists("/dummy.jpg")) {
+        canvas.drawJpgFile(SPIFFS, "/dummy.jpg");
+      }
+    }
+  }
+
+  if (showWeeklyForecast) {
+    displayWeeklyForecast();
+  } else {
+    displayWeatherInfo();
+  }
+  displayTemperatureAndHumidity();
+  drawDateTime();
+  if (showStatusInfo) {
+    drawVersionInfo();
+    drawWiFiStatus();
+    drawBatteryStatus();
+  }
+  
+  if (fullUpdate) {
+    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+  } else {
+    canvas.pushCanvas(0, 0, UPDATE_MODE_DU4);
+  }
+  
+  Serial.println("表示を更新しました");
+}
+
+void displayWeatherInfo() {
+  canvas.setTextColor(WHITE, BLACK);
+  canvas.setTextSize(2);
+  
+  int baseX = 40;
+  int baseY = 500;
+  int lineHeight = 20;
+  
+  canvas.drawString("Today   :", baseX, baseY);
+  canvas.drawString(todayWeather, baseX + 120, baseY);
+  canvas.drawString(String(todayTempMax) + "/" + String(todayTempMin), baseX + 240, baseY);
+  canvas.drawString(String(todayPop) + "%", baseX + 320, baseY);
+  
+  baseY += lineHeight;
+  
+  canvas.drawString("Tomorrow:", baseX, baseY);
+  canvas.drawString(tomorrowWeather, baseX + 120, baseY);
+  canvas.drawString(String(tomorrowTempMax) + "/" + String(tomorrowTempMin), baseX + 240, baseY);
+  canvas.drawString(String(tomorrowPop) + "%", baseX + 320, baseY);
+}
+
+void displayWeeklyForecast() {
+  int baseX = 40;
+  int baseY = 500;
+  int iconY = baseY + 20;
+  String daysOfWeek[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+  int currentDay = timeinfo.tm_wday;
+
+  for (int i = 0; i < 7; i++) {
+    int dayIndex = (currentDay + i) % 7;
+    String day = daysOfWeek[dayIndex];
+    
+    canvas.setTextColor((dayIndex == 0 || dayIndex == 6) ? LIGHTGREY : WHITE);
+    canvas.drawString(day, baseX + i * 30, baseY);
+    
+    drawWeatherIcon(weeklyWeather[i], baseX + i * 30, iconY);
+  }
+}
+
+void drawWeatherIcon(String weather, int x, int y) {
+  String iconPath = "/icons/";
+  if (weather == "Clear") iconPath += "clear.png";
+  else if (weather == "Cloudy") iconPath += "cloudy.png";
+  else if (weather == "Rain") iconPath += "rain.png";
+  else if (weather == "Snow") iconPath += "snow.png";
+  else if (weather == "Thunderstorm") iconPath += "thunderstorm.png";
+  else if (weather == "Partly Cloudy") iconPath += "partly_cloudy.png";
+  else if (weather == "Light Rain") iconPath += "light_rain.png";
+  else if (weather == "Heavy Rain") iconPath += "heavy_rain.png";
+  else if (weather == "Fog") iconPath += "fog.png";
+  else iconPath += "unknown.png";
+
+  if (SPIFFS.exists(iconPath)) {
+    canvas.drawPngFile(SPIFFS, iconPath.c_str(), x, y, 20, 20);
+  } else {
+    canvas.drawRect(x, y, 20, 20, WHITE);
+  }
+}
+
+void displayTemperatureAndHumidity() {
+  canvas.setTextColor(WHITE, BLACK);
+  canvas.setTextSize(2);
+  canvas.setTextDatum(4);
+  
+  String tempHumidStr = String(temperature, 1) + "°C " + String(humidity, 1) + "%";
+  canvas.drawString(tempHumidStr, 830, 500);
+}
+
+void drawDateTime() {
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    logError("時刻の取得に失敗しました");
+    return;
+  }
+  
+  char dateTime[30];
+  strftime(dateTime, sizeof(dateTime), "%Y/%m/%d %H:%M (%a)", &timeinfo);
+  
+  canvas.fillRect(700, 500, 260, 40, BLACK);
+  
+  canvas.setTextColor(WHITE);
+  canvas.setTextSize(2);
+  canvas.setTextDatum(4);
+  canvas.drawString(dateTime, 880, 520);
+}
+
+void drawVersionInfo() {
+  canvas.setTextColor(WHITE);
+  canvas.setTextSize(2);
+  canvas.setTextDatum(TR_DATUM);
+  canvas.drawString("Comic Clock Ver." + String(version), 940, 20);
+}
+
+void drawWiFiStatus() {
+  canvas.setTextSize(2);
+  canvas.setTextDatum(TL_DATUM);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    canvas.setTextColor(WHITE);
+  } else {
+    canvas.setTextColor(DARKGREY);
+  }
+
+  canvas.drawString("WiFi", 25, 25);
+  canvas.drawRect(20, 20, 60, 30, WHITE);
+}
+
+void drawBatteryStatus() {
+  uint32_t vol = M5.getBatteryVoltage();
+  int batteryLevel = map(vol, 3300, 4350, 0, 100);
+  batteryLevel = constrain(batteryLevel, 0, 100);
+  
+  canvas.setTextSize(2);
+  canvas.setTextDatum(TL_DATUM);
+  canvas.setTextColor(WHITE);
+
+  String batteryText = String(batteryLevel) + "%";
+  canvas.drawString(batteryText, 105, 25);
+  canvas.drawRect(100, 20, 60, 30, WHITE);
+}
+void logError(const String& errorMessage) {
+  if (!config.errorLogging) return;
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("時刻の取得に失敗しました");
+    return;
+  }
+
+  char timestamp[20];
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+  String logEntry = String(timestamp) + ": " + errorMessage + "\n";
+
+  File logFile = SPIFFS.open(errorLogFilePath, FILE_APPEND);
+  if (logFile) {
+    logFile.print(logEntry);
+    logFile.close();
+  } else {
+    Serial.println("エラーログファイルを開けませんでした");
+  }
+}
+
+void logBatteryStatus() {
+  if (!config.batteryLogging) return;
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    logError("時刻の取得に失敗しました");
+    return;
+  }
+
+  char timestamp[20];
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+  uint32_t voltage = M5.getBatteryVoltage();
+  int batteryLevel = map(voltage, 3300, 4350, 0, 100);
+  batteryLevel = constrain(batteryLevel, 0, 100);
+
+  String logEntry = String(timestamp) + "," + String(voltage) + "," + String(batteryLevel) + "\n";
+
+  File logFile = SPIFFS.open(batteryLogFilePath, FILE_APPEND);
+  if (logFile) {
+    logFile.print(logEntry);
+    logFile.close();
+  } else {
+    logError("バッテリーログファイルを開けませんでした");
+  }
+}
+
+void checkAndReboot() {
+  time_t now;
+  time(&now);
+  struct tm *timeinfo = localtime(&now);
+  
+  if (now - lastRebootTime >= config.rebootInterval * 24 * 3600) {
+    if (timeinfo->tm_hour == 0 && timeinfo->tm_min == 0) {
+      logError("自動再起動を実行します");
+      ESP.restart();
+    }
+  }
+}
+
+void copyLogsToSD() {
+  if (SD.exists(errorLogFilePath)) {
+    SD.remove(errorLogFilePath);
+  }
+  if (SD.exists(batteryLogFilePath)) {
+    SD.remove(batteryLogFilePath);
+  }
+
+  File sourceFile = SPIFFS.open(errorLogFilePath, FILE_READ);
+  File destFile = SD.open(errorLogFilePath, FILE_WRITE);
+  if (sourceFile && destFile) {
+    while (sourceFile.available()) {
+      destFile.write(sourceFile.read());
+    }
+    sourceFile.close();
+    destFile.close();
+  }
+
+  sourceFile = SPIFFS.open(batteryLogFilePath, FILE_READ);
+  destFile = SD.open(batteryLogFilePath, FILE_WRITE);
+  if (sourceFile && destFile) {
+    while (sourceFile.available()) {
+      destFile.write(sourceFile.read());
+    }
+    sourceFile.close();
+    destFile.close();
+  }
+
+  // ログファイルをSPIFFSから削除
+  SPIFFS.remove(errorLogFilePath);
+  SPIFFS.remove(batteryLogFilePath);
+}
+
+void displayStartupProgress(int progress, const char* message) {
+  canvas.fillCanvas(0);
+  canvas.setTextColor(WHITE);
+  
+  canvas.setTextSize(3);
+  canvas.setTextDatum(TC_DATUM);
+  canvas.drawString(config.startupMessage.isEmpty() ? "COMIC CLOCK Loading ..." : config.startupMessage.c_str(), 480, 200);
+  
+  int barWidth = 600;
+  int barHeight = 40;
+  int barX = (960 - barWidth) / 2;
+  int barY = 270;
+  canvas.drawRect(barX, barY, barWidth, barHeight, WHITE);
+  canvas.fillRect(barX, barY, barWidth * progress / 100, barHeight, WHITE);
+  
+  canvas.setTextSize(2);
+  canvas.drawString(message, 480, 340);
+  
+  canvas.pushCanvas(0, 0, UPDATE_MODE_DU4);
+}
+
+void saveWeatherIconsToSPIFFS() {
+  String iconNames[] = {"clear.png", "cloudy.png", "rain.png", "snow.png", "thunderstorm.png", "partly_cloudy.png", "light_rain.png", "heavy_rain.png", "fog.png", "unknown.png"};
+  for (String iconName : iconNames) {
+    String sdPath = "/icons/" + iconName;
+    String spiffsPath = "/icons/" + iconName;
+    if (SD.exists(sdPath)) {
+      copyFile(SD, sdPath.c_str(), SPIFFS, spiffsPath.c_str());
+    }
+  }
+}
+
+
+/*
+バージョン履歴：
+1.0: 初期バージョン - 基本的な時計機能とランダム画像表示
+1.1: プログレスバーの追加 - 起動時の進捗を視覚化
+1.2: 天気情報の位置変更と都市名の追加 - レイアウトの改善
+1.3: 自動再起動機能の追加 - 週次での自動再起動を実装
+1.4: 起動シーケンスの詳細表示 - 起動プロセスの可視化を強化
+1.5: バージョン情報の表示 - 右上にバージョン番号を表示
+1.6: WiFi再接続機能の追加 - 接続が切れた際の自動再接続を実装
+1.7: WiFi接続状態の表示 - 左上にWiFi接続状態を表示
+1.8: 天気情報の最下段への移動と都市名の削除 - レイアウトの最終調整
+1.9: 起動時のエラー処理改善 - 初期化失敗時も起動を続行
+2.0: 起動完了後の待機表示 - "Please wait" メッセージの点滅表示を追加
+2.1: WiFi状態とバッテリー残量表示の改善 - 四角で囲んで表示
+2.2: バッテリー電圧取得方法の修正 - M5.getBatteryVoltage()を使用
+2.3: ステータス情報の表示切替機能 - G38スイッチで表示/非表示を切替
+2.4: 画像リスト読み込みの最適化と進捗表示の追加
+2.5: 天気情報表示位置の調整 - より見やすいレイアウトに変更
+2.6: 画像リスト読み込みの高速化 - 固定ファイル名方式の採用
+2.7: 内蔵SHT30センサーからの温湿度データ取得と表示機能の追加
+2.8: 日時表示位置を50ピクセル右にずらす
+2.9: 画像ファイル数を起動時にカウントして自動設定
+3.0: G38ボタンの動作を割り込みを使用して改善
+3.1: 設定ファイルからの読み込み機能を追加
+3.2: 複数Wi-Fi設定の対応
+3.3: 画像切替え間隔と自動再起動間隔の設定機能を追加
+4.0: ディープスリープを利用した省電力化を実装
+4.1: SDカードへのエラーログ記録機能を追加、設定ファイルでの制御機能を実装
+4.2: バッテリーログ記録機能を追加、設定ファイルでの制御機能を実装
+4.3: 省電力化の強化（Wi-Fi接続最適化、画面更新最適化、センサー読み取り頻度の設定化）
+4.4: 画像ファイル名形式を変更（imgXXXX.jpg）、最大9999枚の画像に対応
+4.5: 天気アイコンの種類を増やし、より詳細な天気表現に対応
+4.6: G37とG38のボタンレスポンスを改善（割り込み処理の実装）
+4.7: bootlogo.pngを起動シーケンスの背景に表示する機能を追加
+4.8: 設定ファイル、天気アイコン、ダミー画像の管理を改善（本体保存とSDカード更新）
+4.9: 起動時のメッセージをconfig.txtで設定可能に変更、必要なファイルの自動生成機能を追加
+*/
